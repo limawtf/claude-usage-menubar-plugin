@@ -37,12 +37,15 @@ from datetime import datetime, timezone, timedelta, date
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 
 CACHE_DIR = os.path.expanduser("~/Library/Caches/claude-usage-menubar")
 USAGE_CACHE = os.path.join(CACHE_DIR, "usage.json")
 COST_CACHE = os.path.join(CACHE_DIR, "cost.json")
+PROFILE_CACHE = os.path.join(CACHE_DIR, "profile.json")
 USAGE_TTL = 300  # s; the usage endpoint has its own rate limit -> call at most every 5 min (avoids 429)
 COST_TTL = 180   # s; ccusage is slowish -> recompute at most every 3 min
+PROFILE_TTL = 6 * 3600  # s; plan tier almost never changes -> refresh at most every 6h
 
 # Homebrew Apple Silicon (/opt/homebrew/bin) + Intel (/usr/local/bin); where node/ccusage live
 BIN_PATHS = ["/opt/homebrew/bin", "/usr/local/bin"]
@@ -211,6 +214,71 @@ def get_costs():
 # --------------------------------------------------------------------------- #
 # Formatting helpers
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Plan tier (oauth/profile) -> exact plan name (keychain subscriptionType is wrong)
+# --------------------------------------------------------------------------- #
+def fetch_profile(token):
+    req = urllib.request.Request(PROFILE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+    })
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+
+def get_profile(token, allow_fetch=True):
+    """OAuth profile (carries rate_limit_tier) with a long cache. Free metadata, same
+    cache/fallback shape as get_usage. allow_fetch=False skips the network entirely and
+    uses only the cache (caller passes this when usage already showed we are offline, so
+    the render never waits on a second doomed request). Any failure -> None (caller
+    falls back to the keychain subscriptionType)."""
+    try:
+        if time.time() - os.stat(PROFILE_CACHE).st_mtime < PROFILE_TTL:
+            with open(PROFILE_CACHE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    if allow_fetch:
+        try:
+            d = fetch_profile(token)
+            _cache_write(PROFILE_CACHE, d)
+            return d
+        except Exception:
+            pass
+    try:  # refresh not possible/allowed -> fall back to any (even stale) cached profile
+        with open(PROFILE_CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def profile_tier(prof):
+    """Pull rate_limit_tier out of the profile (it lives under 'organization', but
+    check a couple of spots so a shape change does not break us). None if absent."""
+    if not isinstance(prof, dict):
+        return None
+    org = prof.get("organization") if isinstance(prof.get("organization"), dict) else {}
+    acc = prof.get("account") if isinstance(prof.get("account"), dict) else {}
+    return org.get("rate_limit_tier") or prof.get("rate_limit_tier") or acc.get("rate_limit_tier")
+
+
+def plan_label(tier, fallback=""):
+    """Friendly plan name from rate_limit_tier (e.g. 'default_claude_max_5x' -> 'Max
+    5x'). Falls back to the keychain subscriptionType when the tier is missing/None."""
+    t = (tier or "").lower()
+    if not t:
+        return (fallback or "subscription").capitalize()
+    if "max_20x" in t:
+        return "Max 20x"
+    if "max_5x" in t:
+        return "Max 5x"
+    if "pro" in t:
+        return "Pro"
+    if "free" in t:
+        return "Free"
+    return t.replace("default_", "").replace("_", " ").title()
+
+
 def color(pct):
     if pct >= 95:
         return "#ff3b30"   # red
@@ -304,7 +372,12 @@ def main():
 
     # ----- Dropdown -----
     out("---")
-    out(f"Claude · {(sub or 'subscription').capitalize()} | color=gray")
+    # exact plan name from the profile's rate_limit_tier (the keychain subscriptionType
+    # is wrong: it can read "Pro" for a Max plan). Falls back to the keychain value if the
+    # profile call fails, so this can never blank the header. Skip the network probe when
+    # usage was already served stale (offline) so the render does not wait twice.
+    plan = plan_label(profile_tier(get_profile(token, allow_fetch=(stale is None))), sub)
+    out(f"Claude · {plan} | color=gray")
     if stale:
         out(f"⏳ cached value (API: {stale}) | size=11 color=gray")
     out("---")
